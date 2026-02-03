@@ -45,6 +45,8 @@ public class VideoCapture: NSObject, @unchecked Sendable {
   public var predictor: Predictor!
   public var previewLayer: AVCaptureVideoPreviewLayer?
   public weak var delegate: VideoCaptureDelegate?
+  private var inferenceTimeoutTask: DispatchWorkItem?  // Safety net for stuck inference
+  private var isInferenceRunning = false
   var captureDevice: AVCaptureDevice?
 
   public func stopCapture() {
@@ -213,44 +215,25 @@ public class VideoCapture: NSObject, @unchecked Sendable {
     } catch {}
   }
 
-  private func predictOnFrame(sampleBuffer: CMSampleBuffer) {
-    guard let predictor = predictor else {
-      return
-    }
-    if currentBuffer == nil, let pixelBuffer = CMSampleBufferGetImageBuffer(sampleBuffer) {
-      currentBuffer = pixelBuffer
-      if !frameSizeCaptured {
-        let frameWidth = CGFloat(CVPixelBufferGetWidth(pixelBuffer))
-        let frameHeight = CGFloat(CVPixelBufferGetHeight(pixelBuffer))
-        longSide = max(frameWidth, frameHeight)
-        shortSide = min(frameWidth, frameHeight)
-        frameSizeCaptured = true
-      }
-
-      /// - Tag: MappingOrientation
-      // The frame is always oriented based on the camera sensor,
-      // so in most cases Vision needs to rotate it for the model to work as expected.
-      _ = CGImagePropertyOrientation.up
-      //            switch UIDevice.current.orientation {
-      //            case .portrait:
-      //                imageOrientation = .up
-      //            case .portraitUpsideDown:
-      //                imageOrientation = .down
-      //            case .landscapeLeft:
-      //                imageOrientation = .up
-      //            case .landscapeRight:
-      //                imageOrientation = .up
-      //            case .unknown:
-      //                imageOrientation = .up
-      //
-      //            default:
-      //                imageOrientation = .up
-      //            }
-
-      predictor.predict(sampleBuffer: sampleBuffer, onResultsListener: self, onInferenceTime: self)
-      currentBuffer = nil
-    }
+private func predictOnFrame(sampleBuffer: CMSampleBuffer) {
+  guard let predictor = predictor else {
+    // Safety reset if predictor is missing
+    isInferenceRunning = false
+    return
   }
+  
+  // Safety timeout: reset flag after 2 seconds if callback never arrives
+  inferenceTimeoutTask?.cancel()  // Cancel any previous timeout
+  let timeout = DispatchWorkItem { [weak self] in
+    print("⚠️ Inference timeout - resetting flag to prevent deadlock")
+    self?.isInferenceRunning = false
+  }
+  inferenceTimeoutTask = timeout
+  cameraQueue.asyncAfter(deadline: .now() + 2.0, execute: timeout)
+  
+  // Process frame - REMOVED currentBuffer check (was blocking frames)
+  predictor.predict(sampleBuffer: sampleBuffer, onResultsListener: self, onInferenceTime: self)
+}
 
   func updateVideoOrientation(orientation: AVCaptureVideoOrientation) {
     guard let connection = videoOutput.connection(with: .video) else { return }
@@ -268,10 +251,18 @@ public class VideoCapture: NSObject, @unchecked Sendable {
 
 extension VideoCapture: AVCaptureVideoDataOutputSampleBufferDelegate {
   public func captureOutput(
-    _ output: AVCaptureOutput, didOutput sampleBuffer: CMSampleBuffer,
+    _ output: AVCaptureOutput,
+    didOutput sampleBuffer: CMSampleBuffer,
     from connection: AVCaptureConnection
   ) {
     guard inferenceOK else { return }
+    
+    // CRITICAL FIX: Only process if NOT currently inferring
+    guard !isInferenceRunning else {
+      return  // Drop old frame - we only want the newest
+    }
+    
+    isInferenceRunning = true
     predictOnFrame(sampleBuffer: sampleBuffer)
   }
 }
@@ -293,6 +284,12 @@ extension VideoCapture: AVCapturePhotoCaptureDelegate {
 
 extension VideoCapture: ResultsListener, InferenceTimeListener {
   public func on(inferenceTime: Double, fpsRate: Double) {
+    // ✅ RESET FLAG SYNCHRONOUSLY BEFORE dispatching to main
+    // This ensures next frame can be processed immediately
+    isInferenceRunning = false
+    inferenceTimeoutTask?.cancel()
+    inferenceTimeoutTask = nil
+    
     DispatchQueue.main.async { [weak self] in
       self?.delegate?.onInferenceTime(speed: inferenceTime, fps: fpsRate)
     }
